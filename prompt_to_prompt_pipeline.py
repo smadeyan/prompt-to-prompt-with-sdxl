@@ -1,6 +1,8 @@
-from typing import Any, Callable, List
+import inspect
+from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
 from diffusers.pipelines.stable_diffusion_xl import StableDiffusionXLPipeline
+from diffusers.image_processor import PipelineImageInput
 from processors import *
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
@@ -16,6 +18,85 @@ def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
     # mix with the original results from guidance by factor guidance_rescale to avoid "plain looking" images
     noise_cfg = guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
     return noise_cfg
+
+
+# Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.retrieve_timesteps
+# TODO: pulled in from ToME
+def retrieve_timesteps(
+    scheduler,
+    num_inference_steps: Optional[int] = None,
+    device: Optional[Union[str, torch.device]] = None,
+    timesteps: Optional[List[int]] = None,
+    **kwargs,
+):
+    """
+    Calls the scheduler's `set_timesteps` method and retrieves timesteps from the scheduler after the call. Handles
+    custom timesteps. Any kwargs will be supplied to `scheduler.set_timesteps`.
+
+    Args:
+        scheduler (`SchedulerMixin`):
+            The scheduler to get timesteps from.
+        num_inference_steps (`int`):
+            The number of diffusion steps used when generating samples with a pre-trained model. If used,
+            `timesteps` must be `None`.
+        device (`str` or `torch.device`, *optional*):
+            The device to which the timesteps should be moved to. If `None`, the timesteps are not moved.
+        timesteps (`List[int]`, *optional*):
+                Custom timesteps used to support arbitrary spacing between timesteps. If `None`, then the default
+                timestep spacing strategy of the scheduler is used. If `timesteps` is passed, `num_inference_steps`
+                must be `None`.
+
+    Returns:
+        `Tuple[torch.Tensor, int]`: A tuple where the first element is the timestep schedule from the scheduler and the
+        second element is the number of inference steps.
+    """
+    if timesteps is not None:
+        accepts_timesteps = "timesteps" in set(
+            inspect.signature(scheduler.set_timesteps).parameters.keys()
+        )
+        if not accepts_timesteps:
+            raise ValueError(
+                f"The current scheduler class {scheduler.__class__}'s `set_timesteps` does not support custom"
+                f" timestep schedules. Please check whether you are using the correct scheduler."
+            )
+        scheduler.set_timesteps(timesteps=timesteps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+        num_inference_steps = len(timesteps)
+    else:
+        scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
+        timesteps = scheduler.timesteps
+    return timesteps, num_inference_steps
+
+
+# TODO: pulled in from ToME
+def register_self_time(pipe, i):
+    for name, module in pipe.unet.named_modules():
+        # if name in attn_greenlist:
+        if (name.startswith("mid_block")) and name.endswith("attn1"):
+        # if name.endswith("attn1"):
+        # if name.startswith("down_blocks.2") and name.endswith("attn1"):
+            setattr(module, 'time', i)
+
+
+def token_merge(
+    prompt_embeds: torch.Tensor, idx_merge: List[List[int]]
+) -> torch.Tensor:
+    """
+    prompt_embeds: 77 dim
+    idx_merge: [ [[1],[2]],[[3],[4]] ]
+    """
+
+    for idxs in idx_merge:
+        noun_idx = idxs[0][0]
+        alpha = 1.1
+        prompt_embeds[noun_idx] = alpha * prompt_embeds[idxs[0]].sum(
+            dim=0
+        ) + 1.2 * prompt_embeds[idxs[1]].sum(dim=0)
+        if len(idxs[0]) > 1:
+            prompt_embeds[idxs[0][1:]] = 0
+        prompt_embeds[idxs[1]] = 0
+
+    return prompt_embeds
 
 
 class Prompt2PromptPipeline(StableDiffusionXLPipeline):
@@ -44,7 +125,30 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             Model that extracts features from generated images to be used as inputs for the `safety_checker`.
     """
 
-    _optional_components = ["safety_checker", "feature_extractor"]
+    # the sequence in which model compoents should be offloaded from GPU to CPU memory.
+    model_cpu_offload_seq = "text_encoder->text_encoder_2->image_encoder->unet->vae"
+
+    # declaring which components without which the model should be able to function
+    _optional_components = [
+        "tokenizer",
+        "tokenizer_2",
+        "text_encoder",
+        "text_encoder_2",
+        "image_encoder",
+        "safety_checker", 
+        "feature_extractor"
+    ]
+
+    # the tensors that can be updated through the callback mechanism
+    _callback_tensor_inputs = [
+        "latents",
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "add_text_embeds",
+        "add_time_ids",
+        "negative_pooled_prompt_embeds",
+        "negative_add_time_ids",
+    ]
 
     def check_inputs(
             self,
@@ -63,13 +167,13 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
-        if (callback_steps is None) or (
-                callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0)
-        ):
-            raise ValueError(
-                f"`callback_steps` has to be a positive integer but is {callback_steps} of type"
-                f" {type(callback_steps)}."
-            )
+        # if (callback_steps is None) or (
+        #         callback_steps is not None and (not isinstance(callback_steps, int) or callback_steps <= 0)
+        # ):
+        #     raise ValueError(
+        #         f"`callback_steps` has to be a positive integer but is {callback_steps} of type"
+        #         f" {type(callback_steps)}."
+        #     )
 
         if prompt is not None and prompt_embeds is not None:
             raise ValueError(
@@ -152,8 +256,9 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         height: Optional[int] = None,
         width: Optional[int] = None,
         num_inference_steps: int = 50,
+        timesteps: List[int] = None,
         denoising_end: Optional[float] = None,
-        guidance_scale: float = 7.5,
+        guidance_scale: float = 7.5, ##TODO: change this to 5.0?
         negative_prompt: Optional[Union[str, List[str]]] = None,
         negative_prompt_2: Optional[Union[str, List[str]]] = None,
         num_images_per_prompt: Optional[int] = 1,
@@ -164,6 +269,8 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
         pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        ip_adapter_image: Optional[PipelineImageInput] = None,
+        ip_adapter_image_embeds: Optional[List[torch.FloatTensor]] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
@@ -176,7 +283,10 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         negative_original_size: Optional[Tuple[int, int]] = None,
         negative_crops_coords_top_left: Tuple[int, int] = (0, 0),
         negative_target_size: Optional[Tuple[int, int]] = None,
+        clip_skip: Optional[int] = None,
         attn_res=None,
+        callback_on_step_end_tensor_inputs: List[str] = ["latents"],
+        **kwargs,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -252,6 +362,45 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             (nsfw) content, according to the `safety_checker`.
         """
 
+        callback = None
+        callback_steps = None
+
+        if callback is not None:
+            deprecate(
+                "callback",
+                "1.0.0",
+                "Passing `callback` as an input argument to `__call__` is deprecated, consider use `callback_on_step_end`",
+            )
+        if callback_steps is not None:
+            deprecate(
+                "callback_steps",
+                "1.0.0",
+                "Passing `callback_steps` as an input argument to `__call__` is deprecated, consider use `callback_on_step_end`",
+            )
+
+        # attention_store = kwargs.get("attention_store")
+        indices_to_alter_1 = kwargs.get("indices_to_alter_1")
+        indices_to_alter_2 = kwargs.get("indices_to_alter_2")
+        # attention_res = kwargs.get("attention_res")
+        run_standard_sd = kwargs.get("run_standard_sd")
+        thresholds = kwargs.get("thresholds")
+        scale_factor = kwargs.get("scale_factor")
+        scale_range = kwargs.get("scale_range")
+        smooth_attentions = kwargs.get("smooth_attentions")
+        sigma = kwargs.get("sigma")
+        kernel_size = kwargs.get("kernel_size")
+        prompt_anchor_1 = kwargs.get("prompt_anchor_1")
+        prompt_anchor_2 = kwargs.get("prompt_anchor_2")
+        prompt_merged_1 = kwargs.get("prompt_merged_1")
+        prompt_merged_2 = kwargs.get("prompt_merged_2")
+        prompt_length_1 = kwargs.get("prompt_length_1")
+        prompt_length_2 = kwargs.get("prompt_length_2")
+        token_refinement_steps = kwargs.get("token_refinement_steps")
+        attention_refinement_steps = kwargs.get("attention_refinement_steps")
+        tome_control_steps = kwargs.get("tome_control_steps")
+        eot_replace_step = kwargs.get("eot_replace_step")
+        use_pose_loss = kwargs.get("use_pose_loss")
+
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
@@ -283,6 +432,13 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             negative_pooled_prompt_embeds,
         )
 
+        self._guidance_scale = guidance_scale
+        self._guidance_rescale = guidance_rescale
+        self._clip_skip = clip_skip
+        self._cross_attention_kwargs = cross_attention_kwargs
+        self._denoising_end = denoising_end
+        self._interrupt = False
+
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
             batch_size = 1
@@ -291,11 +447,14 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         else:
             batch_size = prompt_embeds.shape[0]
 
+        print("###BATCH SIZE: ", batch_size)
+
         device = self._execution_device
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = guidance_scale > 1.0
+        do_classifier_free_guidance = guidance_scale > 1.0 #TODO: not using this in ToME
+        # do_classifier_free_guidance = False
 
         # 3. Encode input prompt
         text_encoder_lora_scale = (
@@ -319,11 +478,108 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             pooled_prompt_embeds=pooled_prompt_embeds,
             negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
             lora_scale=text_encoder_lora_scale,
+            clip_skip=self.clip_skip, ##TODO: added this
         )
 
+        # TODO: Getting prompt anchor embeddings
+        panchors_1 = []
+        for panchor in prompt_anchor_1:
+            (
+                prompt_anchor_emb,
+                _,
+                _,
+                _,
+            ) = self.encode_prompt(
+                prompt=panchor,
+                prompt_2=panchor,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                negative_prompt=negative_prompt,
+                negative_prompt_2=negative_prompt,
+                prompt_embeds=None,
+                negative_prompt_embeds=None,
+                pooled_prompt_embeds=None,
+                negative_pooled_prompt_embeds=None,
+                lora_scale=text_encoder_lora_scale,
+                clip_skip=self.clip_skip,
+            )
+            panchors_1.append(prompt_anchor_emb)
+        
+        panchors_2 = []
+        for panchor in prompt_anchor_2:
+            (
+                prompt_anchor_emb,
+                _,
+                _,
+                _,
+            ) = self.encode_prompt(
+                prompt=panchor,
+                prompt_2=panchor,
+                device=device,
+                num_images_per_prompt=num_images_per_prompt,
+                do_classifier_free_guidance=self.do_classifier_free_guidance,
+                negative_prompt=negative_prompt,
+                negative_prompt_2=negative_prompt,
+                prompt_embeds=None,
+                negative_prompt_embeds=None,
+                pooled_prompt_embeds=None,
+                negative_pooled_prompt_embeds=None,
+                lora_scale=text_encoder_lora_scale,
+                clip_skip=self.clip_skip,
+            )
+            panchors_2.append(prompt_anchor_emb)
+
+        # TODO: Getting merged prompt embeddings
+        (
+            prompt_merged_emb_1,
+            _,
+            _,
+            _,
+        ) = self.encode_prompt(
+            prompt=prompt_merged_1,
+            prompt_2=prompt_merged_1,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt_2,
+            prompt_embeds=None,
+            negative_prompt_embeds=None,
+            pooled_prompt_embeds=None,
+            negative_pooled_prompt_embeds=None,
+            lora_scale=text_encoder_lora_scale,
+            clip_skip=self.clip_skip,
+        )
+
+        (
+            prompt_merged_emb_2,
+            _,
+            _,
+            _,
+        ) = self.encode_prompt(
+            prompt=prompt_merged_2,
+            prompt_2=prompt_merged_2,
+            device=device,
+            num_images_per_prompt=num_images_per_prompt,
+            do_classifier_free_guidance=self.do_classifier_free_guidance,
+            negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt_2,
+            prompt_embeds=None,
+            negative_prompt_embeds=None,
+            pooled_prompt_embeds=None,
+            negative_pooled_prompt_embeds=None,
+            lora_scale=text_encoder_lora_scale,
+            clip_skip=self.clip_skip,
+        )
+
+
         # 4. Prepare timesteps
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
+        # self.scheduler.set_timesteps(num_inference_steps, device=device)
+        # timesteps = self.scheduler.timesteps
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, device, timesteps
+        ) #TODO: using ToME's timestep setting
 
         # 5. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
@@ -337,7 +593,8 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             generator,
             latents,
         )
-        latents[1] = latents[0]
+        print("###LATENTS SHAPE: ", latents.shape)
+        latents[1] = latents[0] # setting initial latents to be similar
 
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
@@ -355,6 +612,7 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                 negative_crops_coords_top_left,
                 negative_target_size,
                 dtype=prompt_embeds.dtype,
+                text_encoder_projection_dim=self.text_encoder_2.config.projection_dim, # TODO: added from ToME
             )
         else:
             negative_add_time_ids = add_time_ids
@@ -382,7 +640,38 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             num_inference_steps = len(list(filter(lambda ts: ts >= discrete_timestep_cutoff, timesteps)))
             timesteps = timesteps[:num_inference_steps]
 
+        # TODO: Added from ToME (Optionally get Guidance Scale Embedding)
+        timestep_cond = None
+        if self.unet.config.time_cond_proj_dim is not None:
+            guidance_scale_tensor = torch.tensor(self.guidance_scale - 1).repeat(
+                batch_size * num_images_per_prompt
+            )
+            timestep_cond = self.get_guidance_scale_embedding(
+                guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
+            ).to(device=device, dtype=latents.dtype)
+
+        self.timestep_cond = timestep_cond
+        self._num_timesteps = len(timesteps)
+        self.timesteps = timesteps
+
+        scale_range = np.linspace(
+            scale_range[0], scale_range[1], len(self.scheduler.timesteps)
+        )
+        ##
+
         added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+
+        # TODO: Added from ToME
+        added_cond_kwargs2 = {
+            "text_embeds": torch.zeros_like(add_text_embeds[1:]),
+            "time_ids": add_time_ids[1:],
+        }
+
+        self.added_cond_kwargs2 = added_cond_kwargs2
+        self.negative_prompt_embeds = negative_prompt_embeds
+        self.pos = None
+        ##
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
@@ -467,7 +756,50 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             else:
                 continue
             cross_att_count += 1
-            attn_procs[name] = P2PCrossAttnProcessor(controller=controller, place_in_unet=place_in_unet)
+            # attn_procs[name] = P2PCrossAttnProcessor(controller=controller, place_in_unet=place_in_unet)
+            attn_procs[name] = AttendExciteCrossAttnProcessor(
+                attnstore=controller, place_in_unet=place_in_unet
+            )
 
         self.unet.set_attn_processor(attn_procs)
         controller.num_att_layers = cross_att_count
+
+    # def register_attention_control(model, controller):
+    #     attn_greenlist = ["up_blocks.0.attentions.1.transformer_blocks.1.attn2.processor",
+    #                     "up_blocks.0.attentions.1.transformer_blocks.2.attn2.processor",
+    #                     "up_blocks.0.attentions.1.transformer_blocks.3.attn2.processor",
+    #                     "up_blocks.0.attentions.1.transformer_blocks.1.attn1.processor",
+    #                     "up_blocks.0.attentions.1.transformer_blocks.2.attn1.processor",
+    #                     "up_blocks.0.attentions.1.transformer_blocks.3.attn1.processor"]
+    #     attn_procs = {}
+    #     cross_att_count = 0
+    #     for name in model.unet.attn_processors.keys():
+    #         if name not in attn_greenlist:
+    #             attn_procs[name] = model.unet.attn_processors[name]
+    #             continue
+    #         #     # if name.startswith('mid_block') and name.endswith("attn1.processor"):
+    #         #     #     attn_procs[name] = CompactAttnProcessor(controller, 'mid')
+    #         #     # else:
+    #         #     #     attn_procs[name] = model.unet.attn_processors[name]
+    #         #     # continue
+    #         #     if name.endswith("attn2.processor"):
+    #         #         attn_procs[name] = CompactAttnProcessor(controller, name.split("_")[0])
+    #         #     else:
+    #         #         attn_procs[name] = model.unet.attn_processors[name]
+    #         #     continue
+    #         if name.startswith("mid_block"):
+    #             place_in_unet = "mid"
+    #         elif name.startswith("up_blocks"):
+    #             place_in_unet = "up"
+    #         elif name.startswith("down_blocks"):
+    #             place_in_unet = "down"
+    #         else:
+    #             continue
+
+    #         cross_att_count += 1
+    #         attn_procs[name] = AttendExciteCrossAttnProcessor(
+    #             attnstore=controller, place_in_unet=place_in_unet
+    #         )
+
+    #     model.unet.set_attn_processor(attn_procs)
+    #     controller.num_att_layers = cross_att_count
