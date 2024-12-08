@@ -125,7 +125,7 @@ class P2PCrossAttnProcessor:
 
 
 def create_controller(
-    prompts: List[str], cross_attention_kwargs: Dict, num_inference_steps: int, tokenizer, device, attn_res
+    prompts: List[str], cross_attention_kwargs: Dict, num_inference_steps: int, tokenizer, device, attn_res, enable_edit=False
 ) -> AttentionControl:
     edit_type = cross_attention_kwargs.get("edit_type", None)
     local_blend_words = cross_attention_kwargs.get("local_blend_words", None)
@@ -151,7 +151,7 @@ def create_controller(
     if edit_type == "refine" and local_blend_words is None:
         print("###n_cross_replace: ", n_cross_replace)
         return AttentionRefine(
-            prompts, num_inference_steps, n_cross_replace, n_self_replace, tokenizer=tokenizer, device=device, attn_res=attn_res
+            prompts, num_inference_steps, n_cross_replace, n_self_replace, tokenizer=tokenizer, device=device, attn_res=attn_res, enable_edit=enable_edit
         )
 
     # refine + localblend
@@ -206,7 +206,8 @@ def create_controller(
     raise ValueError(f"Edit type {edit_type} not recognized. Use one of: replace, refine, reweight.")
 
 
-class AttentionControl(abc.ABC):
+class AttentionControlTome(abc.ABC):
+
     def step_callback(self, x_t):
         return x_t
 
@@ -223,8 +224,105 @@ class AttentionControl(abc.ABC):
 
     def __call__(self, attn, is_cross: bool, place_in_unet: str):
         if self.cur_att_layer >= self.num_uncond_att_layers:
-            h = attn.shape[0]
-            attn[h // 2 :] = self.forward(attn[h // 2 :], is_cross, place_in_unet)
+            self.forward(attn, is_cross, place_in_unet)
+        self.cur_att_layer += 1
+        if self.cur_att_layer == self.num_att_layers + self.num_uncond_att_layers:
+            self.cur_att_layer = 0
+            self.cur_step += 1
+            self.between_steps()
+
+    def reset(self):
+        self.cur_step = 0
+        self.cur_att_layer = 0
+
+    def __init__(self):
+        self.cur_step = 0
+        self.num_att_layers = -1
+        self.cur_att_layer = 0
+
+class AttentionStoreTome(AttentionControlTome):
+
+    @staticmethod
+    def get_empty_store():
+        return {"down_cross": [], "mid_cross": [], "up_cross": [],
+                "down_self": [], "mid_self": [], "up_self": []}
+
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
+        if attn.shape[1] <= 32 ** 2:  # avoid memory overhead
+            self.step_store[key].append(attn)
+        return attn
+
+    def between_steps(self):
+        self.attention_store = self.step_store
+        if self.save_global_store:
+            with torch.no_grad():
+                if len(self.global_store) == 0:
+                    self.global_store = self.step_store
+                else:
+                    for key in self.global_store:
+                        for i in range(len(self.global_store[key])):
+                            self.global_store[key][i] += self.step_store[key][i].detach()
+        self.step_store = self.get_empty_store()
+
+    def get_average_attention(self):
+        average_attention = self.attention_store
+        return average_attention
+
+    def get_average_global_attention(self):
+        average_attention = {key: [item / self.cur_step for item in self.global_store[key]] for key in
+                             self.attention_store}
+        return average_attention
+
+    def reset(self):
+        super(AttentionStoreTome, self).reset()
+        self.step_store = self.get_empty_store()
+        self.attention_store = {}
+        self.global_store = {}
+
+    def __init__(self, save_global_store=False):
+        '''
+        Initialize an empty AttentionStore
+        :param step_index: used to visualize only a specific step in the diffusion process
+        '''
+        super(AttentionStoreTome, self).__init__()
+        self.save_global_store = save_global_store
+        self.step_store = self.get_empty_store()
+        self.attention_store = {}
+        self.global_store = {}
+        self.curr_step_index = 0
+
+
+class AttentionControl(abc.ABC):
+    def enable_token_refine(self):
+        self.enable_edit = False
+
+    def disable_token_refine(self):
+        self.enable_edit = True
+
+    def step_callback(self, x_t):
+        return x_t
+
+    def between_steps(self):
+        return
+
+    @property
+    def num_uncond_att_layers(self):
+        return 0
+
+    @abc.abstractmethod
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        raise NotImplementedError
+
+    def __call__(self, attn, is_cross: bool, place_in_unet: str):
+        if self.cur_att_layer >= self.num_uncond_att_layers:
+            if self.enable_edit:
+                print("###ATTENTION CONTROL EDIT ENABLED")
+                h = attn.shape[0]
+                attn[h // 2 :] = self.forward(attn[h // 2 :], is_cross, place_in_unet)
+            else:
+                print("###ATTENTION CONTROL EDIT DISABLED")
+                self.forward(attn, is_cross, place_in_unet)
         self.cur_att_layer += 1
         if self.cur_att_layer == self.num_att_layers + self.num_uncond_att_layers:
             self.cur_att_layer = 0
@@ -236,11 +334,13 @@ class AttentionControl(abc.ABC):
         self.cur_step = 0
         self.cur_att_layer = 0
 
-    def __init__(self, attn_res=None):
+    def __init__(self, enable_edit = False, attn_res=None):
         self.cur_step = 0
         self.num_att_layers = -1
         self.cur_att_layer = 0
+        print("###SETTING attn_res IN CONTROL: ", attn_res)
         self.attn_res = attn_res
+        self.enable_edit = False
 
 
 class EmptyControl(AttentionControl):
@@ -286,6 +386,12 @@ class EmptyControl(AttentionControl):
 
 class AttentionStore(AttentionControl):
 
+    def enable_token_refine(self):
+        super(AttentionStore, self).enable_token_refine()
+
+    def disable_token_refine(self):
+        super(AttentionStore, self).disable_token_refine()
+
     @staticmethod
     def get_empty_store():
         return {"down_cross": [], "mid_cross": [], "up_cross": [],
@@ -324,12 +430,12 @@ class AttentionStore(AttentionControl):
         self.attention_store = {}
         self.global_store = {}
 
-    def __init__(self, save_global_store=False, attn_res=None):
+    def __init__(self, save_global_store=False, attn_res=None, enable_edit=False):
         '''
         Initialize an empty AttentionStore
         :param step_index: used to visualize only a specific step in the diffusion process
         '''
-        super(AttentionStore, self).__init__(attn_res)
+        super(AttentionStore, self).__init__(enable_edit=enable_edit, attn_res=attn_res)
         self.save_global_store = save_global_store
         self.step_store = self.get_empty_store()
         self.attention_store = {}
@@ -376,12 +482,23 @@ class LocalBlend:
 
 
 class AttentionControlEdit(AttentionStore, abc.ABC):
+    def enable_token_refine(self):
+        super(AttentionControlEdit, self).enable_token_refine()
+        self.enable_edit = False
+
+    def disable_token_refine(self):
+        super(AttentionControlEdit, self).disable_token_refine()
+        self.enable_edit = True
+
     def step_callback(self, x_t):
         if self.local_blend is not None:
             x_t = self.local_blend(x_t, self.attention_store)
         return x_t
 
     def replace_self_attention(self, attn_base, att_replace):
+        print("###att_replace: ", att_replace)
+        print("###self.attn_res: ", self.attn_res)
+        print()
         if att_replace.shape[2] <= self.attn_res[0]**2:
             return attn_base.unsqueeze(0).expand(att_replace.shape[0], *attn_base.shape)
         else:
@@ -392,22 +509,26 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         raise NotImplementedError
 
     def forward(self, attn, is_cross: bool, place_in_unet: str):
-        super(AttentionControlEdit, self).forward(attn, is_cross, place_in_unet)
-        if is_cross or (self.num_self_replace[0] <= self.cur_step < self.num_self_replace[1]):
-            h = attn.shape[0] // (self.batch_size)
-            attn = attn.reshape(self.batch_size, h, *attn.shape[1:])
-            attn_base, attn_replace = attn[0], attn[1:]
-            if is_cross:
-                alpha_words = self.cross_replace_alpha[self.cur_step]
-                attn_replace_new = (
-                    self.replace_cross_attention(attn_base, attn_replace) * alpha_words
-                    + (1 - alpha_words) * attn_replace
-                )
-                attn[1:] = attn_replace_new
-            else:
-                attn[1:] = self.replace_self_attention(attn_base, attn_replace)
-            attn = attn.reshape(self.batch_size * h, *attn.shape[2:])
-        return attn
+        print("###EDIT STATUS IN CONTROL EDIT: ", self.enable_edit)
+        attn_without_edit = super(AttentionControlEdit, self).forward(attn, is_cross, place_in_unet)
+        if self.enable_edit:
+            if is_cross or (self.num_self_replace[0] <= self.cur_step < self.num_self_replace[1]):
+                h = attn.shape[0] // (self.batch_size)
+                attn = attn.reshape(self.batch_size, h, *attn.shape[1:])
+                attn_base, attn_replace = attn[0], attn[1:]
+
+                if is_cross:
+                    alpha_words = self.cross_replace_alpha[self.cur_step]
+                    attn_replace_new = (
+                        self.replace_cross_attention(attn_base, attn_replace) * alpha_words
+                        + (1 - alpha_words) * attn_replace
+                    )
+                    attn[1:] = attn_replace_new
+                else:
+                    attn[1:] = self.replace_self_attention(attn_base, attn_replace)
+                attn = attn.reshape(self.batch_size * h, *attn.shape[2:])
+            return attn
+        return attn_without_edit
 
     def __init__(
         self,
@@ -418,13 +539,15 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         local_blend: Optional[LocalBlend],
         tokenizer,
         device,
+        enable_edit: bool = False,
         attn_res=None,
     ):
-        super(AttentionControlEdit, self).__init__(attn_res=attn_res)
+        super(AttentionControlEdit, self).__init__(enable_edit=enable_edit, attn_res=attn_res)
         # add tokenizer and device here
 
         self.tokenizer = tokenizer
         self.device = device
+        self.enable_edit = enable_edit
 
         self.batch_size = len(prompts)
         self.cross_replace_alpha = get_time_words_attention_alpha(
@@ -472,10 +595,12 @@ class AttentionRefine(AttentionControlEdit):
         local_blend: Optional[LocalBlend] = None,
         tokenizer=None,
         device=None,
-        attn_res=None
+        attn_res=None,
+        enable_edit=False
     ):
+        print("###REFINE INFERENCE STEPS: ", num_steps)
         super(AttentionRefine, self).__init__(
-            prompts, num_steps, cross_replace_steps, self_replace_steps, local_blend, tokenizer, device, attn_res
+            prompts, num_steps, cross_replace_steps, self_replace_steps, local_blend, tokenizer, device, enable_edit=enable_edit, attn_res=attn_res
         )
         self.mapper, alphas = get_refinement_mapper(prompts, self.tokenizer)
         self.mapper, alphas = self.mapper.to(self.device), alphas.to(self.device)
@@ -747,3 +872,43 @@ def aggregate_attention(attention_store: AttentionStore,
     out = torch.cat(out, dim=0)
     out = out.sum(0) / out.shape[0]
     return out
+
+def register_attention_control_tome(model, controller, use_p2p=False):
+        attn_greenlist = ["up_blocks.0.attentions.1.transformer_blocks.1.attn2.processor",
+                        "up_blocks.0.attentions.1.transformer_blocks.2.attn2.processor",
+                        "up_blocks.0.attentions.1.transformer_blocks.3.attn2.processor",
+                        "up_blocks.0.attentions.1.transformer_blocks.1.attn1.processor",
+                        "up_blocks.0.attentions.1.transformer_blocks.2.attn1.processor",
+                        "up_blocks.0.attentions.1.transformer_blocks.3.attn1.processor"]
+        attn_procs = {}
+        cross_att_count = 0
+        for name in model.unet.attn_processors.keys():
+            if name not in attn_greenlist:
+                attn_procs[name] = model.unet.attn_processors[name]
+                continue
+            #     # if name.startswith('mid_block') and name.endswith("attn1.processor"):
+            #     #     attn_procs[name] = CompactAttnProcessor(controller, 'mid')
+            #     # else:
+            #     #     attn_procs[name] = model.unet.attn_processors[name]
+            #     # continue
+            #     if name.endswith("attn2.processor"):
+            #         attn_procs[name] = CompactAttnProcessor(controller, name.split("_")[0])
+            #     else:
+            #         attn_procs[name] = model.unet.attn_processors[name]
+            #     continue
+            if name.startswith("mid_block"):
+                place_in_unet = "mid"
+            elif name.startswith("up_blocks"):
+                place_in_unet = "up"
+            elif name.startswith("down_blocks"):
+                place_in_unet = "down"
+            else:
+                continue
+
+            cross_att_count += 1
+            attn_procs[name] = AttendExciteCrossAttnProcessor(
+                attnstore=controller, place_in_unet=place_in_unet
+            )
+
+        model.unet.set_attn_processor(attn_procs)
+        controller.num_att_layers = cross_att_count

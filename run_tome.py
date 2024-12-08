@@ -83,7 +83,7 @@ if __name__ == "__main__":
     image = pipe(
         prompts, 
         cross_attention_kwargs=cross_attention_kwargs,
-        # attn_res = config.attention_res, # add to config
+        attention_res = config.attention_res, # add to config
         guidance_scale=config.guidance_scale, # add to config
         indices_to_alter_1=token_indices_list[0],
         indices_to_alter_2=token_indices_list[1],
@@ -93,7 +93,13 @@ if __name__ == "__main__":
         prompt_merged_2=prompt_merged_list[1],
         thresholds=config.thresholds, # add to config
         scale_factor=config.scale_factor, # add to config
-        scale_range=config.scale_range, # add to config
+        scale_range=config.scale_range, # add to config,
+        run_standard_sd=config.run_standard_sd,
+        token_refinement_steps=config.token_refinement_steps,
+        attention_refinement_steps=config.attention_refinement_steps,
+        tome_control_steps=config.tome_control_steps,
+        eot_replace_step=config.eot_replace_step,
+        negative_prompt="low res, ugly, blurry, artifact, unreal",
         generator=g_cpu
     )
 

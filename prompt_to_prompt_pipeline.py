@@ -3,6 +3,12 @@ from typing import Any, Callable, Dict, List, Optional, Union, Tuple
 from diffusers.pipelines.stable_diffusion_xl.pipeline_output import StableDiffusionXLPipelineOutput
 from diffusers.pipelines.stable_diffusion_xl import StableDiffusionXLPipeline
 from diffusers.image_processor import PipelineImageInput
+
+import numpy as np
+import torch
+from torch.nn import functional as F
+from torchvision import transforms as T
+
 from processors import *
 
 # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
@@ -66,6 +72,23 @@ def retrieve_timesteps(
         scheduler.set_timesteps(num_inference_steps, device=device, **kwargs)
         timesteps = scheduler.timesteps
     return timesteps, num_inference_steps
+
+
+# TODO: Pulled in from ToME
+def get_centroid(attn_map: torch.Tensor) -> torch.Tensor:
+    """
+    attn_map: h*w*token_len
+    """
+    h, w, seq_len = attn_map.shape
+
+    attn_x, attn_y = attn_map.sum(0), attn_map.sum(1)  # w|h seq_len
+    x = torch.linspace(0, 1, w).to(attn_map.device).reshape(w, 1)
+    y = torch.linspace(0, 1, h).to(attn_map.device).reshape(h, 1)
+
+    centroid_x = (x * attn_x).sum(0) / attn_x.sum(0)  # seq_len
+    centroid_y = (y * attn_y).sum(0) / attn_y.sum(0)  # bs seq_len
+    centroid = torch.stack((centroid_x, centroid_y), -1)  # (seq_len, 2)
+    return centroid
 
 
 # TODO: pulled in from ToME
@@ -223,6 +246,7 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                 "If `negative_prompt_embeds` are provided, `negative_pooled_prompt_embeds` also have to be passed. Make sure to generate `negative_pooled_prompt_embeds` from the same text encoder that was used to generate `negative_prompt_embeds`."
             )
 
+    # TODO: Not being used anywhere
     def _aggregate_and_get_attention_maps_per_token(self, with_softmax):
         attention_maps = self.controller.aggregate_attention(
             from_where=("up_cross", "down_cross", "mid_cross"),
@@ -247,6 +271,249 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             attention_maps[:, :, i] for i in range(attention_maps.shape[2])
         ]
         return attention_maps_list
+
+    @staticmethod
+    def _update_stoken(
+        stoken: torch.Tensor, loss: torch.Tensor, step_size: float
+    ) -> torch.Tensor:
+        """Update the merged token according to the computed loss."""
+        loss = loss * step_size
+        grad_cond = torch.autograd.grad(loss.requires_grad_(True), [stoken])[0]
+        stoken = stoken - grad_cond
+        return stoken
+    
+    def opt_token(self, latents: torch.Tensor, t, stoken, prompt_anchor, iter_num=3):
+        """
+        latents: 128 128 4
+        stoken: dim
+        prompt_anchor: 77 dim
+        """
+        stoken.requires_grad_(True)
+
+        print("##OPT TIMESTEP: ", t)
+        print("##STOKEN SHAPE: ", stoken.shape)
+        print("###LATENT_ANCHOR SHAPE PASSED TO OPT: ", latents.shape)
+        print("###PROMPT ANCHOR SHAPE IN OPT: ", prompt_anchor.shape)
+
+        latents = latents.clone().detach().unsqueeze(0)
+        print("###LATENT_ANCHOR SHAPE PASSED TO OPT UNSQUEEZED: ", latents.shape)
+        iteration = 0
+
+        print("###CROSS_ATTENTION_KWARGS: ", self.cross_attention_kwargs)
+        print("###ADDED_COND_KWARGS: ", self.added_cond_kwargs2)
+
+        with torch.no_grad():
+            noise_pred_anchor = self.unet(
+                latents,
+                t,
+                encoder_hidden_states=prompt_anchor,
+                timestep_cond=self.timestep_cond,
+                cross_attention_kwargs=None,
+                added_cond_kwargs=self.added_cond_kwargs2,
+            ).sample
+        while True:
+            print("###ITERATION: ", iteration)
+            iteration += 1
+            noise_pred_token = self.unet(
+                latents,
+                t,
+                encoder_hidden_states=stoken.unsqueeze(0).unsqueeze(0),
+                timestep_cond=self.timestep_cond,
+                cross_attention_kwargs=None,
+                added_cond_kwargs=self.added_cond_kwargs2,
+            ).sample
+
+            loss = torch.nn.functional.mse_loss(noise_pred_anchor, noise_pred_token)
+
+            stoken = self._update_stoken(stoken, loss, 10000)
+            if iteration >= iter_num:
+                print(
+                    f"Semantic binding loss optimization Exceeded max number of iterations ({iter_num}) "
+                )
+                break
+
+        with torch.no_grad():
+            noise_pred_null = self.unet(
+                latents,
+                t,
+                encoder_hidden_states=self.negative_prompt_embeds[1:],
+                timestep_cond=self.timestep_cond,
+                cross_attention_kwargs=None,
+                added_cond_kwargs=self.added_cond_kwargs2,
+            ).sample
+
+            noise_pred = noise_pred_null + self.guidance_scale * (
+                noise_pred_null - noise_pred_anchor
+            )
+
+            noise_pred = rescale_noise_cfg(
+                noise_pred,
+                noise_pred_anchor,
+                guidance_rescale=self.guidance_rescale,
+            )
+            # compute the previous noisy sample x_t -> x_t-1
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+
+            self.scheduler._step_index -= 1
+        return stoken, latents[0]
+    
+
+    def _entropy_loss(
+        self,
+        attention_store: AttentionStore,
+        indices_to_alter: List[int],
+        attention_res: int = 16,
+        pose_loss: bool = False,
+        prompt_idx: int = 0
+    ):
+        """Aggregates the attention for each token and computes the max activation value for each token to alter."""
+        attention_maps = aggregate_attention(
+            attention_store=attention_store,
+            res=attention_res,
+            from_where=("up", "down", "mid"),
+            is_cross=True,
+            select=0,
+        )  # h w 77
+
+        loss = 0
+
+        prompt = self.prompts[prompt_idx] if isinstance(self.prompts, list) else self.prompts
+        print("###ENTROPY LOSS FOR PROMPT: ", prompt)
+        last_idx = len(self.tokenizer(prompt)["input_ids"]) - 1
+
+        attention_for_text = attention_maps[:, :, 1:last_idx]
+        attention_for_text = torch.nn.functional.softmax(
+            attention_for_text / 0.5, dim=-1
+        )
+
+        # get pos idx and calculate pos loss
+        indices = []
+        for i in range(len(indices_to_alter)):
+            curr_idx = indices_to_alter[i][0][0]
+            indices.append(curr_idx)
+
+        indices = [i - 1 for i in indices]
+        cross_map = attention_for_text[:, :, indices]  # 32,32 seq_len
+        cross_map = (cross_map - cross_map.amin(dim=(0, 1), keepdim=True)) / (
+            cross_map.amax(dim=(0, 1), keepdim=True)
+            - cross_map.amin(dim=(0, 1), keepdim=True)
+        )
+        cross_map = cross_map / cross_map.sum(dim=(0, 1), keepdim=True)
+
+        loss = loss - 2 * (cross_map * torch.log(cross_map + 1e-5)).sum()
+        if pose_loss: # this is False in config 2
+            idx = 0
+            for subject_idx, subject_idx2 in [indices]:
+                # Shift indices since we removed the first token
+                curr_map = attention_for_text[
+                    :, :, [subject_idx, subject_idx2]
+                ]  # h w k
+
+                vis_map = curr_map.permute(2, 0, 1)  # k h w
+                sub_map, sub_map2 = vis_map[0], vis_map[1]
+
+                sub_map = (sub_map - sub_map.min()) / (sub_map.max() - sub_map.min())
+                sub_map2 = (sub_map2 - sub_map2.min()) / (
+                    sub_map2.max() - sub_map2.min()
+                )
+
+                curr_map = torch.stack([sub_map, sub_map2])  # k h w
+                curr_map = curr_map.permute(1, 2, 0)  # h w k
+                pair_pos = get_centroid(curr_map) * 32  # (2, 2) k 2
+
+                pos1 = torch.tensor([10.0, 16]).to("cuda")
+
+                pos2 = torch.tensor([25.0, 16]).to("cuda")
+
+                loss = loss + (0.2 * (pair_pos[0] - pos1) ** 2).mean()
+                loss = loss + (0.2 * (pair_pos[1] - pos2) ** 2).mean()
+
+                T.ToPILImage()(sub_map.reshape(1, 32, 32)).save("mask_left.png")
+                T.ToPILImage()(sub_map2.reshape(1, 32, 32)).save("mask_right.png")
+        return loss
+    
+    @staticmethod
+    def _update_latent(
+        latents: torch.Tensor, loss: torch.Tensor, step_size: float
+    ) -> torch.Tensor:
+        """Update the latent according to the computed loss."""
+        grad_cond = torch.autograd.grad(
+            loss.requires_grad_(True), [latents], retain_graph=True
+        )[0]
+        latents = latents - 0.5 * step_size * grad_cond
+        return latents
+
+    @staticmethod
+    def _update_text(
+        text_embeddings: torch.Tensor, loss: torch.Tensor, step_size: float
+    ) -> torch.Tensor:
+        """Update the latent according to the computed loss."""
+        grad_cond = torch.autograd.grad(
+            loss.requires_grad_(True), [text_embeddings], retain_graph=True
+        )[0]
+        text_embeddings = text_embeddings - step_size * grad_cond
+        return text_embeddings
+
+    def _perform_iterative_refinement_step(
+        self,
+        latents: torch.Tensor,
+        indices_to_alter: List[Tuple[int, int]],
+        threshold: float,
+        text_embeddings: torch.Tensor,
+        attention_store: AttentionStore,
+        step_size: float,
+        t: int,
+        attention_res: int = 32,
+        max_refinement_steps: List[int] = [3, 3],
+        pose_loss: bool = False,
+        prompt_idx: int = 1
+    ):
+        """
+        Performs the iterative latent refinement introduced in the paper. Here, we continuously update the latent
+        code and text embedding according to our loss objective until the given threshold is reached for all tokens.
+        """
+        threshold = threshold / 2 * len(indices_to_alter)
+        threshold -= 2
+        ratio = t / 1000
+        if ratio > 0.9:
+            max_refinement_steps = max_refinement_steps[0]
+        if ratio <= 0.9:
+            max_refinement_steps = max_refinement_steps[1]
+        iteration = 0
+        while True:
+            iteration += 1
+            torch.cuda.empty_cache()
+            latents = latents.clone().detach().requires_grad_(True)
+            text_embeddings = text_embeddings.clone().detach().requires_grad_(True)
+
+            noise_pred_text = self.unet(
+                latents,
+                t,
+                encoder_hidden_states=text_embeddings[1].unsqueeze(0),
+                timestep_cond=self.timestep_cond,
+                cross_attention_kwargs=self.cross_attention_kwargs,
+                added_cond_kwargs=self.added_cond_kwargs2,
+            ).sample
+
+            print("###GETTING ENTROPY LOSS")
+            loss = self._entropy_loss(
+                attention_store, indices_to_alter, attention_res, pose_loss=pose_loss, prompt_idx=prompt_idx
+            )
+            if loss != 0:  # and t/1000 > 0.8:
+                latents = self._update_latent(latents, loss, step_size)
+                text_embeddings = self._update_text(text_embeddings, loss, step_size)
+
+            if loss < threshold:
+                break
+            if iteration >= max_refinement_steps:
+                print(
+                    f"Entropy loss optimization Exceeded max number of iterations ({max_refinement_steps}) "
+                )
+                break
+
+        return latents, loss, text_embeddings.detach()
+
+
 
     @torch.no_grad()
     def __call__(
@@ -381,7 +648,7 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         # attention_store = kwargs.get("attention_store")
         indices_to_alter_1 = kwargs.get("indices_to_alter_1")
         indices_to_alter_2 = kwargs.get("indices_to_alter_2")
-        # attention_res = kwargs.get("attention_res")
+        attention_res = kwargs.get("attention_res")
         run_standard_sd = kwargs.get("run_standard_sd")
         thresholds = kwargs.get("thresholds")
         scale_factor = kwargs.get("scale_factor")
@@ -402,8 +669,16 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         use_pose_loss = kwargs.get("use_pose_loss")
 
         # 0. Default height and width to unet
+        print("###HEIGHT RECEIVED: ", height)
+        print("###WIDTH RECEIVED: ", width)
+        print("###DEFAULT SAMPLE SIZE: ", self.unet.config.sample_size)
+        print("###VAE SCALE FACTOR: ", self.vae_scale_factor)
+
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        print("###HEIGHT SET: ", height)
+        print("###WIDTH SET: ", width)
 
         original_size = original_size or (height, width)
         target_size = target_size or (height, width)
@@ -413,9 +688,13 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         self.attn_res = attn_res
 
         self.controller = create_controller(
-            prompt, cross_attention_kwargs, num_inference_steps, tokenizer=self.tokenizer, device=self.device, attn_res=self.attn_res
+            prompt, cross_attention_kwargs, num_inference_steps, tokenizer=self.tokenizer, device=self.device, attn_res=self.attn_res, enable_edit=True
         )
         self.register_attention_control(self.controller)  # add attention controller
+        attention_store =self.controller
+        # register_attention_control_tome(self, AttentionStoreTome()) 
+
+        self.prompts = prompt # for use in _entropy_loss
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -481,6 +760,15 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             clip_skip=self.clip_skip, ##TODO: added this
         )
 
+        print("###PROMPTS: ",  prompt)
+        print("###INDICES TO ALTER 1: ", indices_to_alter_1)
+        print("###INDICES TO ALTER 2: ", indices_to_alter_2)
+        print("###PROMPT_2 (expecting None): ", prompt_2)
+        print("###PROMPT EMBEDS SHAPE: ", prompt_embeds.shape)
+        print("###PROMPT EMBEDS: ", prompt_embeds.shape)
+        print("###NEGATIVE PROMPT EMBEDS SHAPE: ", negative_prompt_embeds.shape)
+        print("###NEGATIVE PROMPT EMBEDS: ", negative_prompt_embeds)
+
         # TODO: Getting prompt anchor embeddings
         panchors_1 = []
         for panchor in prompt_anchor_1:
@@ -505,6 +793,9 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                 clip_skip=self.clip_skip,
             )
             panchors_1.append(prompt_anchor_emb)
+
+        print("###PROMPT ANCHOR: ", prompt_anchor_1)
+        print("###PROMPT ANCHOR EMBEDS SHAPE: ", prompt_anchor_emb.shape)
         
         panchors_2 = []
         for panchor in prompt_anchor_2:
@@ -529,6 +820,9 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                 clip_skip=self.clip_skip,
             )
             panchors_2.append(prompt_anchor_emb)
+        
+        print("###PROMPT ANCHOR 2: ", prompt_anchor_2)
+        print("###PROMPT ANCHOR EMBEDS SHAPE: ", prompt_anchor_emb.shape)
 
         # TODO: Getting merged prompt embeddings
         (
@@ -552,6 +846,9 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             clip_skip=self.clip_skip,
         )
 
+        print("###MERGED PROMPT 1: ", prompt_merged_1)
+        print("###MERGED PROMPT EMBEDS SHAPE 1: ", prompt_merged_emb_1.shape)
+
         (
             prompt_merged_emb_2,
             _,
@@ -572,6 +869,18 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             lora_scale=text_encoder_lora_scale,
             clip_skip=self.clip_skip,
         )
+
+        print("###MERGED PROMPT 2: ", prompt_merged_2)
+        print("###MERGED PROMPT 2 EMBEDS SHAPE: ", prompt_merged_emb_2.shape)
+
+        if not run_standard_sd and token_refinement_steps:
+            print("###TOKEN MERGING FOR PROMPT 1")
+            # print("###ORIGINAL EMBEDDINGS 1: ", prompt_embeds[0])
+            prompt_embeds[0] = token_merge(prompt_embeds[0], indices_to_alter_1)
+            print("###TOKEN MERGING FOR PROMPT 2")
+            # print("###ORIGINAL EMBEDDINGS 2: ", prompt_embeds[1])
+            prompt_embeds[1] = token_merge(prompt_embeds[1], indices_to_alter_2)
+            
 
 
         # 4. Prepare timesteps
@@ -602,10 +911,13 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
 
         # 7. Prepare added time ids & embeddings
         add_text_embeds = pooled_prompt_embeds
+        print("###ADD_TEXT_EMBEDS SHAPE 1: ", add_text_embeds.shape)
+        print("###ADD_TEXT_EMBEDS 1: ", add_text_embeds)
         add_time_ids = self._get_add_time_ids(
             original_size, crops_coords_top_left, target_size, dtype=prompt_embeds.dtype,
             text_encoder_projection_dim=self.text_encoder_2.config.projection_dim # if none should be changed to enc1
         )
+        print("###ADD_TIME_IDS SHAPE 1: ", add_time_ids.shape)
         if negative_original_size is not None and negative_target_size is not None:
             negative_add_time_ids = self._get_add_time_ids(
                 negative_original_size,
@@ -617,14 +929,32 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         else:
             negative_add_time_ids = add_time_ids
 
+        # TODO: Added this
+        n1 = negative_prompt_embeds[0:1]  # shape [1, 77, 2048]
+        n2 = negative_prompt_embeds[1:2]  # shape [1, 77, 2048]
+        p1 = prompt_embeds[0:1]          # shape [1, 77, 2048]
+        p2 = prompt_embeds[1:2]          # shape [1, 77, 2048]
+
         if do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
             add_text_embeds = torch.cat([negative_pooled_prompt_embeds, add_text_embeds], dim=0)
             add_time_ids = torch.cat([negative_add_time_ids, add_time_ids], dim=0)
 
+        print("###ADD_TIME_IDS SHAPE 2: ", add_time_ids.shape)
+
+        print("###ADD_TEXT_EMBEDS SHAPE 2: ", add_text_embeds.shape)
+        print("###ADD_TEXT_EMBEDS 2: ", add_text_embeds)
+
         prompt_embeds = prompt_embeds.to(device)
         add_text_embeds = add_text_embeds.to(device)
+        add_time_ids_og = add_time_ids
+        add_time_ids_og = add_time_ids_og.to(device)
         add_time_ids = add_time_ids.to(device).repeat(batch_size * num_images_per_prompt, 1)
+
+        print("###NUM IMAGES PER PROMPT: ", num_images_per_prompt)
+        print("###ADD_TIME_IDS SHAPE 3: ", add_time_ids.shape)
+        print("###ADD_TIME_IDS: ", add_time_ids)
+
 
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
@@ -661,10 +991,13 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
 
         added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
 
+        text_embeds_og = torch.zeros(1, 1280)
+        text_embeds_og = text_embeds_og.to(device)
         # TODO: Added from ToME
         added_cond_kwargs2 = {
-            "text_embeds": torch.zeros_like(add_text_embeds[1:]),
-            "time_ids": add_time_ids[1:],
+            # "text_embeds": torch.zeros_like(add_text_embeds[1:]),
+            "text_embeds": text_embeds_og,
+            "time_ids": add_time_ids_og[1:],
         }
 
         self.added_cond_kwargs2 = added_cond_kwargs2
@@ -672,15 +1005,184 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         self.pos = None
         ##
 
+        print("###CURRENT PROMPT EMBEDS SHAPE: ", prompt_embeds.shape)
+        print("###CURRENT PROMPT EMBEDS: ", prompt_embeds)
+
+        latent_anchor_1 = None
+        latent_anchor_2 = None
+        updated_prompt_embeds_1 = None
+        updated_prompt_embeds_2 = None
+
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
+                register_self_time(self, None)
+
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                print("###LATENT_MODEL_INPUTS SHAPE: ", latent_model_input.shape)
+
+                # TODO: Setting latent anchors like in ToME, but for both prompts
+                latent_anchor_1 = (
+                    torch.cat([latents[0:1]] * len(panchors_1))
+                    if latent_anchor_1 is None
+                    else latent_anchor_1
+                )
+                latent_anchor_1 = self.scheduler.scale_model_input(latent_anchor_1, t)
+                print("###LATENT_ANCHOR 1 SHAPE: ", latent_anchor_1.shape)
+
+                latent_anchor_2 = (
+                    torch.cat([latents[1:]] * len(panchors_2))
+                    if latent_anchor_2 is None
+                    else latent_anchor_2
+                )
+                latent_anchor_2 = self.scheduler.scale_model_input(latent_anchor_2, t)
+                print("###LATENT_ANCHOR 2 SHAPE: ", latent_anchor_2.shape)
+                ##
+
+                # ToME: initializing varaibles that will be updated during the ToME refinement process
+                updated_latents_1 = (
+                    latent_model_input[1:2].clone().detach()
+                )
+
+                print("###LATENTS_UP 1 SHAPE: ", updated_latents_1.shape)
+
+                updated_latents_2 = (
+                    latent_model_input[3:].clone().detach()
+                )
+
+                print("###LATENTS_UP 2 SHAPE: ", updated_latents_2.shape)
+
+                updated_prompt_embeds_1 = (
+                    torch.cat([n1, p1], dim=0) if updated_prompt_embeds_1 is None else updated_prompt_embeds_1
+                )
+                print("###UPDATED_PROMPT_EMBEDS 1 SHAPE: ", updated_prompt_embeds_1.shape)
+
+                updated_prompt_embeds_2 = (
+                    torch.cat([n2, p2], dim=0) if updated_prompt_embeds_2 is None else updated_prompt_embeds_2
+                )
+                print("###UPDATED_PROMPT_EMBEDS 2 SHAPE: ", updated_prompt_embeds_2.shape)
+                ##
+                
+                with torch.enable_grad():
+                    if not run_standard_sd:
+                        self.controller.enable_token_refine()
+                        token_control, attention_control = tome_control_steps
+
+                        #EOT Replace
+                        if i == eot_replace_step:
+                            print("###IN EOT REPLACE STEP")
+                            updated_prompt_embeds_1[1, prompt_length_1 + 1 :] = prompt_merged_emb_1[0][prompt_length_1 + 1 :]
+                            updated_prompt_embeds_2[1, prompt_length_2 + 1 :] = prompt_merged_emb_2[0][prompt_length_2 + 1 :]
+
+                        # Applying semantic binding loss for token refinement
+                        if i < token_control:
+                            # For original prompt
+                            for idx, panchor in enumerate(panchors_1):
+                                stoken = (
+                                    updated_prompt_embeds_1[1, indices_to_alter_1[idx][0][0]].detach().clone()
+                                )
+
+                                stoken, latent_anchor_1[idx] = self.opt_token(
+                                    latent_anchor_1[idx],
+                                    t,
+                                    stoken,
+                                    panchor,
+                                    token_refinement_steps,
+                                )
+                                updated_prompt_embeds_1[1, indices_to_alter_1[idx][0][0]] = stoken
+
+                            # For edit prompt
+                            for idx, panchor in enumerate(panchors_2):
+                                stoken = (
+                                    updated_prompt_embeds_2[1, indices_to_alter_2[idx][0][0]].detach().clone()
+                                )
+
+                                stoken, latent_anchor_2[idx] = self.opt_token(
+                                    latent_anchor_2[idx],
+                                    t,
+                                    stoken,
+                                    panchor,
+                                    token_refinement_steps,
+                                )
+                                updated_prompt_embeds_2[1, indices_to_alter_2[idx][0][0]] = stoken
+
+                        # Applying entropy loss for attention refinement
+                        if i < attention_control:
+                            # For original prompt
+                            updated_latents_1, loss, updated_prompt_embeds_1 = (
+                                self._perform_iterative_refinement_step(
+                                    latents=updated_latents_1,
+                                    indices_to_alter=indices_to_alter_1,
+                                    threshold=thresholds[i],
+                                    text_embeddings=updated_prompt_embeds_1,
+                                    attention_store=attention_store,
+                                    step_size=scale_factor * scale_range[i],
+                                    t=t,
+                                    attention_res=attention_res,
+                                    max_refinement_steps=attention_refinement_steps,
+                                    pose_loss=use_pose_loss,
+                                    prompt_idx=0,
+                                )
+                            )
+
+                            # For edit prompt
+                            updated_latents_2, loss, updated_prompt_embeds_2 = (
+                                self._perform_iterative_refinement_step(
+                                    latents=updated_latents_2,
+                                    indices_to_alter=indices_to_alter_2,
+                                    threshold=thresholds[i],
+                                    text_embeddings=updated_prompt_embeds_2,
+                                    attention_store=attention_store,
+                                    step_size=scale_factor * scale_range[i],
+                                    t=t,
+                                    attention_res=attention_res,
+                                    max_refinement_steps=attention_refinement_steps,
+                                    pose_loss=use_pose_loss,
+                                    prompt_idx=1,
+                                )
+                            )
+
+                            print(f"Iteration {i} | Loss: {loss:0.4f}")
+
+                
+                print("###UPDATED_LATENTS 1 SHAPE AFTER REFINE (BEFORE CAT): ", updated_latents_1.shape)
+                updated_latents_1 = (
+                    torch.cat([updated_latents_1] * 2)
+                    if do_classifier_free_guidance
+                    else updated_latents_1
+                )
+                print("###UPDATED_LATENTS 1 SHAPE AFTER REFINE (AFTER CAT): ", updated_latents_1.shape)
+
+                print("###UPDATED_LATENTS 2 SHAPE AFTER REFINE (BEFORE CAT): ", updated_latents_2.shape)
+                updated_latents_2 = (
+                    torch.cat([updated_latents_2] * 2)
+                    if do_classifier_free_guidance
+                    else updated_latents_2
+                )
+                print("###UPDATED_LATENTS 2 SHAPE AFTER REFINE (AFTER CAT): ", updated_latents_2.shape)
+
+
+                latent_model_input = torch.cat([updated_latents_1, updated_latents_2], dim=0)
+                # print("###LATENT_MODEL_INPUTS SHAPE AFTER REFINE AND CAT: ", latent_model_input.shape)
+
+                n1 = updated_prompt_embeds_1[0:1]   # First row of first_combination
+                n2 = updated_prompt_embeds_2[0:1]  # First row of second_combination
+                p1 = updated_prompt_embeds_1[1:2]   # Second row of first_combination
+                p2 = updated_prompt_embeds_2[1:2]  # Second row of second_combination
+
+                final_prompt_embeds = torch.cat([n1, p1, n2, p2], dim=0)  # shape [4, 77, 2048]
+                print("###FINAL_PROMPT_EMBEDS SHAPE: ", final_prompt_embeds.shape)
+
+                # self.controller.disable_token_refine()
+
 
                 # predict the noise residual
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds,
+                # noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds,
+                #                        added_cond_kwargs=added_cond_kwargs, ).sample
+                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=final_prompt_embeds,
                                        added_cond_kwargs=added_cond_kwargs, ).sample
+                
 
                 # perform guidance
                 if do_classifier_free_guidance:
@@ -764,42 +1266,4 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         self.unet.set_attn_processor(attn_procs)
         controller.num_att_layers = cross_att_count
 
-    # def register_attention_control(model, controller):
-    #     attn_greenlist = ["up_blocks.0.attentions.1.transformer_blocks.1.attn2.processor",
-    #                     "up_blocks.0.attentions.1.transformer_blocks.2.attn2.processor",
-    #                     "up_blocks.0.attentions.1.transformer_blocks.3.attn2.processor",
-    #                     "up_blocks.0.attentions.1.transformer_blocks.1.attn1.processor",
-    #                     "up_blocks.0.attentions.1.transformer_blocks.2.attn1.processor",
-    #                     "up_blocks.0.attentions.1.transformer_blocks.3.attn1.processor"]
-    #     attn_procs = {}
-    #     cross_att_count = 0
-    #     for name in model.unet.attn_processors.keys():
-    #         if name not in attn_greenlist:
-    #             attn_procs[name] = model.unet.attn_processors[name]
-    #             continue
-    #         #     # if name.startswith('mid_block') and name.endswith("attn1.processor"):
-    #         #     #     attn_procs[name] = CompactAttnProcessor(controller, 'mid')
-    #         #     # else:
-    #         #     #     attn_procs[name] = model.unet.attn_processors[name]
-    #         #     # continue
-    #         #     if name.endswith("attn2.processor"):
-    #         #         attn_procs[name] = CompactAttnProcessor(controller, name.split("_")[0])
-    #         #     else:
-    #         #         attn_procs[name] = model.unet.attn_processors[name]
-    #         #     continue
-    #         if name.startswith("mid_block"):
-    #             place_in_unet = "mid"
-    #         elif name.startswith("up_blocks"):
-    #             place_in_unet = "up"
-    #         elif name.startswith("down_blocks"):
-    #             place_in_unet = "down"
-    #         else:
-    #             continue
-
-    #         cross_att_count += 1
-    #         attn_procs[name] = AttendExciteCrossAttnProcessor(
-    #             attnstore=controller, place_in_unet=place_in_unet
-    #         )
-
-    #     model.unet.set_attn_processor(attn_procs)
-    #     controller.num_att_layers = cross_att_count
+    
