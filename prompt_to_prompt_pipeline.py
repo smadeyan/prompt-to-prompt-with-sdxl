@@ -692,7 +692,10 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         )
         self.register_attention_control(self.controller)  # add attention controller
         attention_store =self.controller
-        # register_attention_control_tome(self, AttentionStoreTome()) 
+        
+        # self.controller = AttentionStoreTome()
+        # register_attention_control_tome(self, self.controller)
+        # attention_store = self.controller
 
         self.prompts = prompt # for use in _entropy_loss
 
@@ -1171,10 +1174,10 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                 p1 = updated_prompt_embeds_1[1:2]   # Second row of first_combination
                 p2 = updated_prompt_embeds_2[1:2]  # Second row of second_combination
 
-                final_prompt_embeds = torch.cat([n1, p1, n2, p2], dim=0)  # shape [4, 77, 2048]
+                final_prompt_embeds = torch.cat([n1, n2, p1, p2], dim=0)  # shape [4, 77, 2048]
                 print("###FINAL_PROMPT_EMBEDS SHAPE: ", final_prompt_embeds.shape)
 
-                # self.controller.disable_token_refine()
+                self.controller.disable_token_refine()
 
 
                 # predict the noise residual
