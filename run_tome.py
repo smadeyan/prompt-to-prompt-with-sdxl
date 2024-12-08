@@ -69,15 +69,22 @@ if __name__ == "__main__":
     #                           "n_cross_replace": {"default_": 1.0, "dragon": 0.4},
     #                           }
 
-    prompts = ["a chocolate cake and a lemon tart", "a confetti chocolate cake and a lemon tart"]
-    prompt_merged_list = ["a cake and a tart", "a cake and a tart"]
+    # prompts = ["a chocolate cake and a lemon tart", "a confetti chocolate cake and a lemon tart"]
+    # prompts = ["a white cat", "a sleeping white cat"]
+    prompts = ["a white cat and a black dog", "a white cat with sunglasses and a black dog"]
+    # prompt_merged_list = ["a cake and a tart", "a cake and a tart"]
+    prompt_merged_list = ["a cat and a dog", "a cat and a dog"]
     # prompts = ["a chocolate cake", "a confetti chocolate cake"]
+    # prompts = ["a chocolate cake", "a chocolate cake with confetti"]
+    # prompt_merged_list = ["a cake", "a cake"]
     token_indices_list, prompt_anchors = process_prompts(prompts)
+
+    print("###PROMPT ANCHORS: ", prompt_anchors)
 
     # prompts = ["a white cat", "a sleeping white cat"]
     cross_attention_kwargs = {"edit_type": "refine",
                               "n_self_replace": 0.4,
-                              "n_cross_replace": {"default_": 1.0, "confetti": 0.8},
+                              "n_cross_replace": {"default_": 1.0, "sunglasses": 0.8},
                               }
 
     image = pipe(
@@ -87,8 +94,12 @@ if __name__ == "__main__":
         guidance_scale=config.guidance_scale, # add to config
         indices_to_alter_1=token_indices_list[0],
         indices_to_alter_2=token_indices_list[1],
-        prompt_anchor_1=prompt_anchors[0],
-        prompt_anchor_2=prompt_anchors[1],
+        # indices_to_alter_1=config.token_indices_1,
+        # indices_to_alter_2=config.token_indices_2,
+        # prompt_anchor_1=prompt_anchors[0],
+        # prompt_anchor_2=prompt_anchors[1],
+        prompt_anchor_1=config.prompt_anchor_1,
+        prompt_anchor_2=config.prompt_anchor_2,
         prompt_merged_1=prompt_merged_list[0],
         prompt_merged_2=prompt_merged_list[1],
         thresholds=config.thresholds, # add to config

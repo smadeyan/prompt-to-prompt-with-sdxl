@@ -317,16 +317,19 @@ class AttentionControl(abc.ABC):
     def __call__(self, attn, is_cross: bool, place_in_unet: str):
         if self.cur_att_layer >= self.num_uncond_att_layers:
             if self.enable_edit:
-                print("###ATTENTION CONTROL EDIT ENABLED")
+                # print("###ATTENTION CONTROL EDIT ENABLED")
                 h = attn.shape[0]
                 attn[h // 2 :] = self.forward(attn[h // 2 :], is_cross, place_in_unet)
             else:
-                print("###ATTENTION CONTROL EDIT DISABLED")
+                # print("###ATTENTION CONTROL EDIT DISABLED")
                 self.forward(attn, is_cross, place_in_unet)
         self.cur_att_layer += 1
         if self.cur_att_layer == self.num_att_layers + self.num_uncond_att_layers:
             self.cur_att_layer = 0
-            self.cur_step += 1
+            if self.enable_edit:
+                self.cur_step += 1
+            else:
+                self.tome_cur_step += 1
             self.between_steps()
         return attn
 
@@ -336,9 +339,10 @@ class AttentionControl(abc.ABC):
 
     def __init__(self, enable_edit = False, attn_res=None):
         self.cur_step = 0
+        self.tome_cur_step = 0
         self.num_att_layers = -1
         self.cur_att_layer = 0
-        print("###SETTING attn_res IN CONTROL: ", attn_res)
+        # print("###SETTING attn_res IN CONTROL: ", attn_res)
         self.attn_res = attn_res
         self.enable_edit = False
 
@@ -496,9 +500,9 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         return x_t
 
     def replace_self_attention(self, attn_base, att_replace):
-        print("###att_replace: ", att_replace)
-        print("###self.attn_res: ", self.attn_res)
-        print()
+        # print("###att_replace: ", att_replace)
+        # print("###self.attn_res: ", self.attn_res)
+        # print()
         if att_replace.shape[2] <= self.attn_res[0]**2:
             return attn_base.unsqueeze(0).expand(att_replace.shape[0], *attn_base.shape)
         else:
@@ -509,7 +513,7 @@ class AttentionControlEdit(AttentionStore, abc.ABC):
         raise NotImplementedError
 
     def forward(self, attn, is_cross: bool, place_in_unet: str):
-        print("###EDIT STATUS IN CONTROL EDIT: ", self.enable_edit)
+        # print("###EDIT STATUS IN CONTROL EDIT: ", self.enable_edit)
         attn_without_edit = super(AttentionControlEdit, self).forward(attn, is_cross, place_in_unet)
         if self.enable_edit:
             if is_cross or (self.num_self_replace[0] <= self.cur_step < self.num_self_replace[1]):
@@ -598,7 +602,7 @@ class AttentionRefine(AttentionControlEdit):
         attn_res=None,
         enable_edit=False
     ):
-        print("###REFINE INFERENCE STEPS: ", num_steps)
+        # print("###REFINE INFERENCE STEPS: ", num_steps)
         super(AttentionRefine, self).__init__(
             prompts, num_steps, cross_replace_steps, self_replace_steps, local_blend, tokenizer, device, enable_edit=enable_edit, attn_res=attn_res
         )

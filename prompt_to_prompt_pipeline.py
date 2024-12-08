@@ -259,6 +259,7 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         return attention_maps_list
 
     @staticmethod
+    # TODO: Not being used anywhere
     def _get_attention_maps_list(
             attention_maps: torch.Tensor, with_softmax
     ) -> List[torch.Tensor]:
@@ -491,7 +492,8 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                 t,
                 encoder_hidden_states=text_embeddings[1].unsqueeze(0),
                 timestep_cond=self.timestep_cond,
-                cross_attention_kwargs=self.cross_attention_kwargs,
+                # cross_attention_kwargs=self.cross_attention_kwargs,
+                cross_attention_kwargs=None,
                 added_cond_kwargs=self.added_cond_kwargs2,
             ).sample
 
@@ -768,9 +770,13 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         print("###INDICES TO ALTER 2: ", indices_to_alter_2)
         print("###PROMPT_2 (expecting None): ", prompt_2)
         print("###PROMPT EMBEDS SHAPE: ", prompt_embeds.shape)
-        print("###PROMPT EMBEDS: ", prompt_embeds.shape)
+        print("###PROMPT EMBEDS 1: ", prompt_embeds[0])
+        print("###PROMPT EMBEDS 2: ", prompt_embeds[1])
         print("###NEGATIVE PROMPT EMBEDS SHAPE: ", negative_prompt_embeds.shape)
         print("###NEGATIVE PROMPT EMBEDS: ", negative_prompt_embeds)
+
+        print()
+        print("###TOKENIZED PROMPT EMBED: ", self.tokenizer.encode(prompt[0]))
 
         # TODO: Getting prompt anchor embeddings
         panchors_1 = []
@@ -990,7 +996,7 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
         scale_range = np.linspace(
             scale_range[0], scale_range[1], len(self.scheduler.timesteps)
         )
-        ##
+        #
 
         added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
 
@@ -1066,18 +1072,17 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                 )
                 print("###UPDATED_PROMPT_EMBEDS 2 SHAPE: ", updated_prompt_embeds_2.shape)
                 ##
-                
-                with torch.enable_grad():
-                    if not run_standard_sd:
+
+                if not run_standard_sd:
+                    with torch.enable_grad():
+                        
                         self.controller.enable_token_refine()
                         token_control, attention_control = tome_control_steps
-
                         #EOT Replace
                         if i == eot_replace_step:
                             print("###IN EOT REPLACE STEP")
                             updated_prompt_embeds_1[1, prompt_length_1 + 1 :] = prompt_merged_emb_1[0][prompt_length_1 + 1 :]
                             updated_prompt_embeds_2[1, prompt_length_2 + 1 :] = prompt_merged_emb_2[0][prompt_length_2 + 1 :]
-
                         # Applying semantic binding loss for token refinement
                         if i < token_control:
                             # For original prompt
@@ -1085,7 +1090,6 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                                 stoken = (
                                     updated_prompt_embeds_1[1, indices_to_alter_1[idx][0][0]].detach().clone()
                                 )
-
                                 stoken, latent_anchor_1[idx] = self.opt_token(
                                     latent_anchor_1[idx],
                                     t,
@@ -1094,13 +1098,11 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                                     token_refinement_steps,
                                 )
                                 updated_prompt_embeds_1[1, indices_to_alter_1[idx][0][0]] = stoken
-
                             # For edit prompt
                             for idx, panchor in enumerate(panchors_2):
                                 stoken = (
                                     updated_prompt_embeds_2[1, indices_to_alter_2[idx][0][0]].detach().clone()
                                 )
-
                                 stoken, latent_anchor_2[idx] = self.opt_token(
                                     latent_anchor_2[idx],
                                     t,
@@ -1109,7 +1111,6 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                                     token_refinement_steps,
                                 )
                                 updated_prompt_embeds_2[1, indices_to_alter_2[idx][0][0]] = stoken
-
                         # Applying entropy loss for attention refinement
                         if i < attention_control:
                             # For original prompt
@@ -1128,7 +1129,6 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                                     prompt_idx=0,
                                 )
                             )
-
                             # For edit prompt
                             updated_latents_2, loss, updated_prompt_embeds_2 = (
                                 self._perform_iterative_refinement_step(
@@ -1145,45 +1145,46 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
                                     prompt_idx=1,
                                 )
                             )
-
                             print(f"Iteration {i} | Loss: {loss:0.4f}")
 
                 
-                print("###UPDATED_LATENTS 1 SHAPE AFTER REFINE (BEFORE CAT): ", updated_latents_1.shape)
-                updated_latents_1 = (
-                    torch.cat([updated_latents_1] * 2)
-                    if do_classifier_free_guidance
-                    else updated_latents_1
-                )
-                print("###UPDATED_LATENTS 1 SHAPE AFTER REFINE (AFTER CAT): ", updated_latents_1.shape)
-
-                print("###UPDATED_LATENTS 2 SHAPE AFTER REFINE (BEFORE CAT): ", updated_latents_2.shape)
-                updated_latents_2 = (
-                    torch.cat([updated_latents_2] * 2)
-                    if do_classifier_free_guidance
-                    else updated_latents_2
-                )
-                print("###UPDATED_LATENTS 2 SHAPE AFTER REFINE (AFTER CAT): ", updated_latents_2.shape)
-
-
-                latent_model_input = torch.cat([updated_latents_1, updated_latents_2], dim=0)
-                # print("###LATENT_MODEL_INPUTS SHAPE AFTER REFINE AND CAT: ", latent_model_input.shape)
-
-                n1 = updated_prompt_embeds_1[0:1]   # First row of first_combination
-                n2 = updated_prompt_embeds_2[0:1]  # First row of second_combination
-                p1 = updated_prompt_embeds_1[1:2]   # Second row of first_combination
-                p2 = updated_prompt_embeds_2[1:2]  # Second row of second_combination
-
-                final_prompt_embeds = torch.cat([n1, n2, p1, p2], dim=0)  # shape [4, 77, 2048]
-                print("###FINAL_PROMPT_EMBEDS SHAPE: ", final_prompt_embeds.shape)
-
                 self.controller.disable_token_refine()
+                
+                if not run_standard_sd:
+                    print("###UPDATED_LATENTS 1 SHAPE AFTER REFINE (BEFORE CAT): ", updated_latents_1.shape)
+                    updated_latents_1 = (
+                        torch.cat([updated_latents_1] * 2)
+                        if do_classifier_free_guidance
+                        else updated_latents_1
+                    )
+                    print("###UPDATED_LATENTS 1 SHAPE AFTER REFINE (AFTER CAT): ", updated_latents_1.shape)
+
+                    print("###UPDATED_LATENTS 2 SHAPE AFTER REFINE (BEFORE CAT): ", updated_latents_2.shape)
+                    updated_latents_2 = (
+                        torch.cat([updated_latents_2] * 2)
+                        if do_classifier_free_guidance
+                        else updated_latents_2
+                    )
+                    print("###UPDATED_LATENTS 2 SHAPE AFTER REFINE (AFTER CAT): ", updated_latents_2.shape)
 
 
-                # predict the noise residual
-                # noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds,
-                #                        added_cond_kwargs=added_cond_kwargs, ).sample
-                noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=final_prompt_embeds,
+                    latent_model_input = torch.cat([updated_latents_1, updated_latents_2], dim=0)
+                    # print("###LATENT_MODEL_INPUTS SHAPE AFTER REFINE AND CAT: ", latent_model_input.shape)
+
+                    n1 = updated_prompt_embeds_1[0:1]   # First row of first_combination
+                    print("###POST REFINEMENT NEGATIVE_EMBEDS 1: ", n1)
+                    n2 = updated_prompt_embeds_2[0:1]  # First row of second_combination
+                    print("###POST REFINEMENT NEGATIVE_EMBEDS 2: ", n2)
+                    p1 = updated_prompt_embeds_1[1:2]   # Second row of first_combination
+                    p2 = updated_prompt_embeds_2[1:2]  # Second row of second_combination
+
+                    final_prompt_embeds = torch.cat([n1, n2, p1, p2], dim=0)  # shape [4, 77, 2048]
+                    print("###FINAL_PROMPT_EMBEDS SHAPE: ", final_prompt_embeds.shape)
+
+                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=final_prompt_embeds,
+                                       added_cond_kwargs=added_cond_kwargs, ).sample
+                else:
+                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=prompt_embeds,
                                        added_cond_kwargs=added_cond_kwargs, ).sample
                 
 
@@ -1261,10 +1262,10 @@ class Prompt2PromptPipeline(StableDiffusionXLPipeline):
             else:
                 continue
             cross_att_count += 1
-            # attn_procs[name] = P2PCrossAttnProcessor(controller=controller, place_in_unet=place_in_unet)
-            attn_procs[name] = AttendExciteCrossAttnProcessor(
-                attnstore=controller, place_in_unet=place_in_unet
-            )
+            attn_procs[name] = P2PCrossAttnProcessor(controller=controller, place_in_unet=place_in_unet)
+            # attn_procs[name] = AttendExciteCrossAttnProcessor(
+            #     attnstore=controller, place_in_unet=place_in_unet
+            # )
 
         self.unet.set_attn_processor(attn_procs)
         controller.num_att_layers = cross_att_count

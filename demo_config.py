@@ -87,6 +87,9 @@ class RunConfig2:
     use_nlp: bool = True
     # Which token indices to merge
     token_indices: List[int] = field(default_factory=lambda: [[[2], [3]], [[6], [7]]])
+    token_indices_1: List[int] = field(default_factory=lambda: [[[2], [3]], [[6], [7]]])
+    # a white cat with sunglasses
+    token_indices_2: List[int] = field(default_factory=lambda: [[[2], [3, 5]], [[8], [9]]]) # [[[2], [3, 4]], [[7], [8, 9]]]
     # Spilt prompt
     # prompt_anchor: List[str] = field(default_factory=lambda:['Musk with black sunglasses', 'Trump with blue suit'])
     prompt_anchor: List[str] = field(
@@ -97,6 +100,21 @@ class RunConfig2:
     )
     # prompt after token merge
     prompt_merged: str = "a cat and a dog"
+
+    prompt_anchor_1: List[str] = field(
+        default_factory=lambda: [
+            "a white cat",
+            "a black dog",
+        ]
+    )
+
+    prompt_anchor_2: List[str] = field(
+        default_factory=lambda: [
+            "a white cat with sunglasses",
+            "a black dog",
+        ]
+    )
+
     # words of the prompt
     prompt_length: int = 7
     # Which random seeds to use when generating
